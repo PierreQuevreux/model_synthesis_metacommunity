@@ -1,0 +1,933 @@
+# R version 3.6.3 (2020-02-29)
+library(ggplot2) # ggplot2_3.3.3
+library(reshape2) # reshape2_1.4.3
+library(scales) # scales_1.1.1
+#library(pracma)
+library(doParallel) # doParallel_1.0.16 iterators_1.0.8   foreach_1.4.3
+library(deSolve) # deSolve_1.28
+library(cowplot) # cowplot_0.9.4
+library(magick) # magick_2.7.1
+library(tidyr) # tidyr_1.1.3
+library(viridis) # viridis_0.5.1
+
+### loaded via a namespace (and not attached): ####
+# [1] Rcpp_1.0.6       pillar_1.6.0     compiler_3.6.3   plyr_1.8.6       tools_3.6.3      lifecycle_1.0.0  tibble_3.1.0     gtable_0.2.0     pkgconfig_2.0.3 
+# [10] rlang_0.4.10     DBI_1.1.1        gridExtra_2.3    withr_2.4.1      dplyr_1.0.5      stringr_1.4.0    generics_0.1.0   vctrs_0.3.6      grid_3.6.3      
+# [19] tidyselect_1.1.0 glue_1.4.2       R6_2.5.0         fansi_0.4.2      purrr_0.3.4      magrittr_2.0.1   codetools_0.2-16 ellipsis_0.3.1   assertthat_0.2.1
+# [28] colorspace_2.0-0 utf8_1.2.1       stringi_1.5.3    munsell_0.5.0    crayon_1.4.1    
+
+### PLOT OPTIONS ####
+
+path_figure="Figures/"
+
+theme<-theme_gray()+
+  theme(panel.background = element_blank(),
+        panel.grid.major.x = element_line(colour='grey'),
+        panel.grid.major.y = element_line(colour='grey'),
+        text = element_text(size=20, family="Times"),
+        axis.text = element_text(size=20),
+        axis.line = element_line(),
+        legend.key=element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+
+corr_colour_TL_2<-scale_colour_manual(values=c("dodgerblue3","chocolate1"),
+                                      labels=c("1","2"),
+                                      guide = guide_legend(reverse = TRUE),
+                                      name='Trophic\nlevel')
+corr_colour_TL_2_TS<-scale_colour_manual(values=c("dodgerblue1","chocolate1","dodgerblue4","chocolate4"),
+                                         guide = guide_legend(reverse = TRUE),
+                                         name='Trophic\nlevel')
+model_line<-scale_linetype_manual(values=c("solid","twodash"),
+                                  guide = guide_legend(reverse = TRUE),
+                                  name='Dispersal')
+disp_line<-scale_linetype_manual(values=c("solid","22"),
+                                 labels=c("density\n-dependent","passive"),
+                                 name='Dispersal')
+patch_line<-scale_linetype_manual(values=c("solid","22"),
+                                  name='Patch')
+weight_line<-scale_linetype_manual(values=c("22","solid"),
+                                  name='Weight of\ndispersal\ndependencies')
+corr_line_TL_2_TS<-scale_linetype_manual(values=c("solid","solid","22","22"),
+                                         guide = guide_legend(reverse = TRUE),
+                                         name='Trophic\nlevel')
+fill_colour_TL_2<-scale_fill_manual(values=c("dodgerblue3","chocolate1"),
+                                    labels=c("1","2"),
+                                    guide = guide_legend(reverse = TRUE),
+                                    name='Trophic\nlevel')
+
+x_axis_log10_short<-scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x)))
+y_axis_log10_short<-scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x)))
+x_axis_log10<-scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                            labels = scales::trans_format("log10", scales::math_format(10^.x)))
+y_axis_log10<-scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                            labels = scales::trans_format("log10", scales::math_format(10^.x)))
+
+# ea and ma factors
+ma01<-expression(italic(ma)*"=0.1")
+ma1<-expression(italic(ma)*"=1")
+ma10<-expression(italic(ma)*"=10")
+ea01<-expression(italic("\u03B5")*italic(a)*"=0.1")
+ea1<-expression(italic("\u03B5")*italic(a)*"=1")
+ea10<-expression(italic("\u03B5")*italic(a)*"=10")
+
+# labels
+label_dispersal<-expression("Scaled dispersal rate "*italic(d["i"]))
+label_correlation<-"Correlation between the two patches"
+label_S0<-expression(paste("Sensitivity coefficient ",italic(S["0,i"])))
+label_CV<-"Coefficient of variation (CV)"
+
+### FUNCTIONS ####
+# Define S values depending on B
+set_S<-function(B,S0,nSpecies,nCommunity,type){
+  S<-rep(NA,nSpecies*nCommunity)
+  if(type=="self"){ # dispersal depending on the focal species
+    for(i in 1:nSpecies){
+      for(j in 1:nCommunity){
+        S[(j-1)*nSpecies+i]=S0*B[(j-1)*nSpecies+i]
+      }
+    }
+  }
+  if(type=="prey"){ # dispersal depending on prey
+    for(i in 2:nSpecies){
+      for(j in 1:nCommunity){
+        S[(j-1)*nSpecies+i]=S0*B[(j-1)*nSpecies+i-1]
+      }
+    }
+  }
+  if(type=="pred"){ # dispersal depending on predator
+    for(i in 1:(nSpecies-1)){
+      for(j in 1:nCommunity){
+        S[(j-1)*nSpecies+i]=S0*B[(j-1)*nSpecies+i+1]
+      }
+    }
+  }
+  return(S)
+}
+
+# Correction of the dispersal rate to avoid the bias induced by density-dependency
+set_C<-function(B,S,nSpecies,nCommunity,type,params){
+  with(as.list(params),{
+    # 0 - simple dispersal
+    W<-rep(C0,nSpecies*nCommunity) # rescaling of the final dispersal rate to 1
+    if(type=="0"){
+      correct<-rep(1,nSpecies*nCommunity) # rescaling of the dispersal component to 1
+      C<-rep(C0,nSpecies*nCommunity) # weight of the component
+    }
+    # self
+    W<-W+C0_self*B # rescaling of the final dispersal rate to 1
+    if(type=="self"){
+      correct<-B/(B+S) # rescaling of the dispersal component to 1
+      if(weight==1){
+        C<-C0_self*B # weight of the component
+      }
+      else{C<-rep(C0_self,nSpecies*nCommunity)}
+    }
+    # prey
+    Bbis<-B
+    Bbis[2:(nSpecies*nCommunity)]<-Bbis[1:(nSpecies*nCommunity-1)]
+    Bbis[is.na(S)]=0
+    W<-W+C0_prey*e*a*Bbis # rescaling of the final dispersal rate to 1
+    if(type=="prey"){
+      correct<-S/(Bbis+S) # rescaling of the dispersal component to 1
+      if(weight==1){
+        C<-C0_prey*e*a*Bbis # weight of the component
+      }
+      else{C<-rep(C0_prey,nSpecies*nCommunity)}
+    }
+    # pred
+    Bbis<-B
+    Bbis[1:(nSpecies*nCommunity-1)]<-Bbis[2:(nSpecies*nCommunity)]
+    Bbis[is.na(S)]=0
+    W<-W+C0_pred*m*a*Bbis # rescaling of the final dispersal rate to 1
+    if(type=="pred"){
+      correct<-Bbis/(Bbis+S) # rescaling of the dispersal component to 1
+      if(weight==1){
+        C<-C0_pred*m*a*Bbis # weight of the component
+      }
+      else{C<-rep(C0_pred,nSpecies*nCommunity)}
+    }
+    # Final
+    if(weight==1){
+      C<-C/W # weighted components
+    }
+    # final correction
+    correct[is.na(correct)]=1
+    if(correction==1){ # rescaling of the dispersal component
+      # effect of the different dispersal components
+      if(nSpecies>1){
+        prey<-rep(1,nSpecies*nCommunity)
+        pred<-rep(1,nSpecies*nCommunity)
+        for(j in 1:nCommunity){
+          prey[(j-1)*nSpecies+1]=0 # no prey for primary producers
+          pred[(j-1)*nSpecies+nSpecies]=0 # ni predator for top predators
+        }
+      }
+      else{prey<-rep(0,nSpecies*nCommunity)
+      pred<-rep(0,nSpecies*nCommunity)}
+      if(weight==0){ # dispersal component not weighted by the intra-patch processes
+        C<-C/(C0+C0_self+prey*C0_prey+pred*C0_pred) # the dispersal components have the same weight (because C0=1, C0_self=1...)
+        C[is.na(C)]=0
+      }
+      C<-C/correct # correction to get a final dispersal rate with a similar value than the case with passive dispersal
+    }
+    return(C)
+  })
+}
+
+# Jacobian single patch J(k)
+jacobian_single<-function(B,params,nSpecies){
+  with(as.list(params),{
+    J<-matrix(0,nrow=nSpecies,ncol=nSpecies)
+    J[1,1]=D*(g/D-2*B[1])
+    if(nSpecies>1){
+      J[1,1]=J[1,1]-D*m*a*B[2] # basal species
+      J[nSpecies,nSpecies]=D*m^(nSpecies-1)*(-r/D-2*B[nSpecies]+e*a*B[nSpecies-1]) # top species
+      for(i in 1:(nSpecies-1)){
+        J[i,i+1]=-D*m^(i-1)*m*a*B[i] # effect of predators
+      }
+      for(i in 2:nSpecies){
+        J[i,i-1]=D*m^(i-1)*e*a*B[i] # effect of prey
+      }
+    }
+    if(nSpecies>2){
+      for(i in 2:(nSpecies-1)){
+        J[i,i]=D*m^(i-1)*(-r/D-2*B[i]+e*a*B[i-1]-m*a*B[i+1]) # intermediate species
+      }
+    }
+    return(J)
+  })
+}
+
+# Jacobian of the intrapatch dynamics J'
+jacobian_intra_patch<-function(B,params,nSpecies,nCommunity){
+  Z<-matrix(0,nrow=nSpecies,ncol=nSpecies)
+  M<-NULL
+  L<-NULL
+  J<-NULL
+  for(i in 1:nCommunity){
+    L<-NULL
+    J<-jacobian_single(B[nSpecies*(i-1)+c(1:nSpecies)],params,nSpecies)
+    for(j in 1:nCommunity){
+      if(j==i){
+        L<-cbind(L,J)
+      }
+      else{
+        L<-cbind(L,Z)
+      }
+    }
+    M<-rbind(M,L)
+  }
+  return(M)
+}
+
+# Jacobian of the dispersal dynamics P'
+jacobian_disp_hauzy<-function(B,params,nSpecies,nCommunity,disp){
+  with(as.list(params),{
+    dim=nSpecies*nCommunity
+    P<-matrix(0,nrow=dim,ncol=dim)
+    # effects of species i on itself
+    S=set_S(B,S0_self,nSpecies,nCommunity,"self")
+    C_0=set_C(B,NA,nSpecies,nCommunity,"0",params)
+    C_self=set_C(B,S,nSpecies,nCommunity,"self",params)
+    for(i in 1:nSpecies){
+      for(j in 1:nCommunity){
+        for(k in 1:nCommunity){
+          row=(j-1)*nSpecies+i
+          col=(k-1)*nSpecies+i
+          if(j==k){
+            P[row,col]=-disp[i]*(C_0[col]+C_self[col]*B[col]*(B[col]+2*S[col])/(B[col]+S[col])^2)
+          }
+          else{
+            P[row,col]=disp[i]*(C_0[col]+C_self[col]*B[col]*(B[col]+2*S[col])/(B[col]+S[col])^2)/(nCommunity-1)
+          }
+        }
+      }
+    }
+    # effects of prey
+    S=set_S(B,S0_prey,nSpecies,nCommunity,"prey")
+    C=set_C(B,S,nSpecies,nCommunity,"prey",params)
+    for(i in 2:nSpecies){
+      for(j in 1:nCommunity){
+        for(k in 1:nCommunity){
+          row=(j-1)*nSpecies+i
+          col=(k-1)*nSpecies+i
+          if(j==k){
+            P[row,col]=P[row,col]-disp[i]*C[col]*S[col]/(B[col-1]+S[col])
+            P[row,col-1]=disp[i]*B[col]*C[col]*S[col]/(B[col-1]+S[col])^2
+          }
+          else{
+            P[row,col]=P[row,col]+disp[i]*C[col]*S[col]/(B[col-1]+S[col])/(nCommunity-1)
+            P[row,col-1]=-disp[i]*B[col]*C[col]*S[col]/(B[col-1]+S[col])^2/(nCommunity-1)
+          }
+        }
+      }
+    }
+    # effects of predators
+    S=set_S(B,S0_pred,nSpecies,nCommunity,"pred")
+    C=set_C(B,S,nSpecies,nCommunity,"pred",params)
+    for(i in 1:(nSpecies-1)){
+      for(j in 1:nCommunity){
+        for(k in 1:nCommunity){
+          row=(j-1)*nSpecies+i
+          col=(k-1)*nSpecies+i
+          if(j==k){
+            P[row,col]=P[row,col]-disp[i]*C[col]*B[col+1]/(B[col+1]+S[col])
+            P[row,col+1]=-disp[i]*B[col]*C[col]*S[col]/(B[col+1]+S[col])^2
+          }
+          else{
+            P[row,col]=P[row,col]+disp[i]*C[col]*B[col+1]/(B[col+1]+S[col])/(nCommunity-1)
+            P[row,col+1]=disp[i]*B[col]*C[col]*S[col]/(B[col+1]+S[col])^2/(nCommunity-1)
+          }
+        }
+      }
+    }
+    # Finalising the matrix
+    for(i in 2:nSpecies){
+      for(j in 1:nCommunity){
+        P[(j-1)*nSpecies+i,]=D*m^(i-1)*P[(j-1)*nSpecies+i,]
+      }
+    }
+    return(P)
+  })
+}
+
+# Jacobian of the dispersal dynamics P' (linear dispersal components)
+jacobian_disp_linear<-function(B,params,nSpecies,nCommunity,disp){
+  with(as.list(params),{
+    dim=nSpecies*nCommunity
+    P<-matrix(0,nrow=dim,ncol=dim)
+    correct<-rep(0,dim)
+    # effects of species i on itself
+    if(correction==1){ # rescaling of the dispersal component
+      C<-C0_self/B
+      correct<-correct+C0_self
+    }else{C<-rep(C0_self,dim)}
+    for(i in 1:nSpecies){
+      for(j in 1:nCommunity){
+        for(k in 1:nCommunity){
+          row=(j-1)*nSpecies+i
+          col=(k-1)*nSpecies+i
+          if(j==k){
+            P[row,col]=-disp[i]*2*C[col]*B[col]
+          }
+          else{
+            P[row,col]=disp[i]*2*C[col]*B[col]
+          }
+        }
+      }
+    }
+    # effects of prey
+    if(correction==1){ # rescaling of the dispersal component
+      C<-C0_prey/c(0,B[1:(dim-1)])
+      C[seq(from=1,to=(nSpecies*(nCommunity-1)+1),by=nSpecies)]=0
+      correct<-correct+C+C0
+    }else{C<-rep(C0_prey,dim)}
+    for(i in 2:nSpecies){
+      for(j in 1:nCommunity){
+        for(k in 1:nCommunity){
+          row=(j-1)*nSpecies+i
+          col=(k-1)*nSpecies+i
+          if(j==k){
+            P[row,col]=P[row,col]-disp[i]*(-C[col]*B[col-1]+C0)
+            P[row,col-1]=disp[i]*C[col]*B[col]
+          }
+          else{
+            P[row,col]=P[row,col]+disp[i]*(-C[col]*B[col-1]+C0)
+            P[row,col-1]=-disp[i]*C[col]*B[col]
+          }
+        }
+      }
+    }
+    # effects of predators
+    if(correction==1){ # rescaling of the dispersal component
+      C<-C0_pred/c(B[2:dim],NA)
+      C[seq(from=nSpecies,to=(nSpecies*nCommunity),by=nSpecies)]=0
+      correct<-correct+C
+    }else{C<-rep(C0_pred,dim)}
+    for(i in 1:(nSpecies-1)){
+      for(j in 1:nCommunity){
+        for(k in 1:nCommunity){
+          row=(j-1)*nSpecies+i
+          col=(k-1)*nSpecies+i
+          if(j==k){
+            P[row,col]=P[row,col]-disp[i]*(C[col]*B[col+1])
+            P[row,col+1]=-disp[i]*C[col]*B[col]
+          }
+          else{
+            P[row,col]=P[row,col]+disp[i]*(C[col]*B[col+1])
+            P[row,col+1]=disp[i]*C[col]*B[col]
+          }
+        }
+      }
+    }
+    # Finalising the matrix
+    for(i in 2:nSpecies){
+      for(j in 1:nCommunity){
+        P[(j-1)*nSpecies+i,]=D*m^(i-1)*P[(j-1)*nSpecies+i,]
+      }
+    }
+    if(correction==1){ # rescaling of the dispersal component
+      # effect of the different dispersal components
+      if(nSpecies>1){
+        prey<-rep(1,nSpecies*nCommunity)
+        pred<-rep(1,nSpecies*nCommunity)
+        for(j in 1:nCommunity){
+          prey[(j-1)*nSpecies+1]=0 # no prey for primary producers
+          pred[(j-1)*nSpecies+nSpecies]=0 # ni predator for top predators
+        }
+      }
+      else{prey<-rep(0,nSpecies*nCommunity)
+      pred<-rep(0,nSpecies*nCommunity)}
+      if(weight==0){ # dispersal component not weighted by the intra-patch processes
+        for(i in 1:dim){
+          P[i,]=P[i,]/(C0+C0_self+prey*C0_prey+pred*C0_pred) # final correction to rescale the dispersal rate
+        }
+        P[is.na(P)]=0
+      }
+    }
+    return(P)
+  })
+}
+
+# Biomasses at equilibrium
+equilibrium<-function(params,nSpecies,nCommunity){ # compute the biomasses at equilibrium
+  with(as.list(params),{
+    A<-diag(rep(-1,nSpecies*nCommunity))
+    for(j in 1:nCommunity){
+      for(i in 2:nSpecies){
+        A[(j-1)*nSpecies+i,(j-1)*nSpecies+i-1]=e*a
+      }
+      for(i in 1:(nSpecies-1)){
+        A[(j-1)*nSpecies+i,(j-1)*nSpecies+i+1]=-m*a
+      }
+    }
+    B<-matrix(r/D,
+              nrow = nSpecies*nCommunity,
+              ncol = 1,
+              byrow = TRUE)
+    for(j in 1:nCommunity){
+      B[(j-1)*nSpecies+1,1]=-g/D
+    }
+    C<-matrix(0,
+              nrow = nSpecies*nCommunity,
+              ncol = 1,
+              byrow = TRUE)
+    C<-solve(A) %*% B
+    return(as.numeric(C))
+  })
+}
+
+# T matrix
+T_matrix<-function(pert,B,z,nSpecies,nCommunity){
+  T<-matrix(0,nSpecies*nCommunity,nSpecies*nCommunity)
+  coord=NULL
+  for(i in 1:length(pert)){
+    coord=(pert[[i]][2]-1)*nSpecies+pert[[i]][1] # pert->list of vector containing the trophic level and the patch of the perturbed species (e.g. (1,2) species 1 in patch 2)
+    T[coord,coord]=1
+  }
+  T<-T*diag(B)^z
+  return(T)
+}
+
+# Lyapunov equation
+lyapunov<-function(J,T,VE,nSpecies,nCommunity){
+  TVT<-T%*%VE%*%t(T)
+  TVT<-matrix(array(TVT),ncol=1)
+  kron<-kronecker(J,diag(rep(1,nSpecies*nCommunity))) + kronecker(diag(rep(1,nSpecies*nCommunity)),J)
+  return(-solve(kron)%*%TVT)
+}
+
+# Parallelised analytic calculation 
+analytic<-function(params_data,jacobian_disp,nSpecies,nCommunity,i){
+  params<-c(g=params_data$g[i],
+            r=params_data$r[i],
+            D=params_data$D[i],
+            m=params_data$m[i],
+            a=params_data$a[i],
+            e=params_data$e[i],
+            S0_self=params_data$S0_self[i],
+            S0_prey=params_data$S0_prey[i],
+            S0_pred=params_data$S0_pred[i],
+            C0=params_data$C0[i],
+            C0_self=params_data$C0_self[i],
+            C0_prey=params_data$C0_prey[i],
+            C0_pred=params_data$C0_pred[i],
+            correction=params_data$correction[i],
+            weight=params_data$weight[i])
+  B<-equilibrium(params,nSpecies,nCommunity)
+  J<-jacobian_intra_patch(B,params,nSpecies,nCommunity)
+  P<-jacobian_disp(B,params,nSpecies,nCommunity,params_data$disp[[i]]) # jacobian_disp_hauzy or jacobian_disp_linear
+  VE<-params_data$VE[[i]]
+  T<-T_matrix(params_data$pert[[i]],B,params_data$z[i],nSpecies,nCommunity)
+  V<-lyapunov(J+P,T,VE,nSpecies,nCommunity)
+  C<-cov2cor(matrix(as.numeric(V),nSpecies*nCommunity,nSpecies*nCommunity))
+  return(list(B,as.numeric(V),as.numeric(C)))
+}
+
+# Create the output dataframe
+create_data<-function(params_data,nSpecies,nCommunity){
+  # biomass
+  data_B<-as.data.frame(matrix(0,dim(params_data)[1],dim(params_data)[2]+nSpecies*nCommunity))
+  names(data_B)[1:dim(params_data)[2]]=names(params_data)
+  data_B[,1:dim(params_data)[2]]=params_data
+  B_names<-expand.grid(c("B"),c(1:nSpecies),c(1:nCommunity))
+  B_names$Var1<-paste(B_names$Var1,B_names$Var2,sep = "_")
+  B_names<-paste(B_names$Var1,B_names$Var3,sep = "")
+  names(data_B)[(dim(params_data)[2]+1):dim(data_B)[2]]=B_names
+  # variance
+  data_V<-as.data.frame(matrix(0,dim(params_data)[1],dim(params_data)[2]+(nSpecies*nCommunity)^2))
+  names(data_V)[1:dim(params_data)[2]]=names(params_data)
+  data_V[,1:dim(params_data)[2]]=params_data
+  V_names<-expand.grid(c(1:nSpecies),c(1:nCommunity))
+  V_names<-paste(V_names$Var1,V_names$Var2,sep = "")
+  V_names<-expand.grid(c("V"),V_names,V_names)
+  V_names<-paste(V_names$Var1,V_names$Var2,V_names$Var3,sep = "_")
+  names(data_V)[(dim(params_data)[2]+1):dim(data_V)[2]]=V_names
+  # correlation
+  data_C<-as.data.frame(matrix(0,dim(params_data)[1],dim(params_data)[2]+(nSpecies*nCommunity)^2))
+  names(data_C)[1:dim(params_data)[2]]=names(params_data)
+  data_C[,1:dim(params_data)[2]]=params_data
+  C_names<-expand.grid(c(1:nSpecies),c(1:nCommunity))
+  C_names<-paste(C_names$Var1,C_names$Var2,sep = "")
+  C_names<-expand.grid(c("C"),C_names,C_names)
+  C_names<-paste(C_names$Var1,C_names$Var2,C_names$Var3,sep = "_")
+  names(data_C)[(dim(params_data)[2]+1):dim(data_C)[2]]=C_names
+  return(list(data_B,data_V,data_C,B_names,V_names,C_names))
+}
+
+# ODE of the system
+ODE_function<-function(t, B, params){
+  with(params,{
+    dB<-rep(0,nSpecies*nCommunity)
+    # intra-patch dynamics
+    ID=0
+    for(j in 1:nCommunity){
+      ID=(j-1)*nSpecies
+      dB[ID+1]=D*B[ID+1]*(g/D - B[ID+1])
+      if(nSpecies>1){
+        for(i in 2:nSpecies){
+          dB[ID+i]=D*m^(i-1)*B[ID+i]*(-r/D - B[ID+i] + e*a*B[ID+i-1])
+        }
+        for(i in 1:(nSpecies-1)){
+          dB[ID+i]=dB[ID+i]+D*m^(i-1)*B[ID+i]*(- m*a*B[ID+i+1])
+        }
+      }
+    }
+    # dispersal dynamics
+    d_matrix<-matrix(C0,nSpecies,nCommunity) # matrix containing the dispersal terms
+    B_matrix<-matrix(B,nSpecies,nCommunity) # matrix containg the biomasses
+    # effects of species i on itself
+    S_matrix<-matrix(S_self,nSpecies,nCommunity) # matrix containing the dispersal sensitivity S
+    C_matrix<-matrix(C_self,nSpecies,nCommunity) # matrix containing the correction coefficients
+    for(i in 1:nSpecies){
+      d_matrix[i,]=d_matrix[i,]+C_matrix[i,]*B_matrix[i,]/(B_matrix[i,]+S_matrix[i,])
+    }
+    # effects of prey
+    S_matrix<-matrix(S_prey,nSpecies,nCommunity)
+    C_matrix<-matrix(C_prey,nSpecies,nCommunity)
+    if(nSpecies>1){
+      for(i in 2:nSpecies){
+        d_matrix[i,]=d_matrix[i,]+C_matrix[i,]*S_matrix[i,]/(B_matrix[i-1,]+S_matrix[i,])
+      }
+    }
+    # effects of predators
+    S_matrix<-matrix(S_pred,nSpecies,nCommunity)
+    C_matrix<-matrix(C_pred,nSpecies,nCommunity)
+    if(nSpecies>1){
+      for(i in 1:(nSpecies-1)){
+        d_matrix[i,]=d_matrix[i,]+C_matrix[i,]*B_matrix[i+1,]/(B_matrix[i+1,]+S_matrix[i,])
+      }
+    }
+    # final equations
+    for(i in 1:nSpecies){
+      d_matrix[i,]=m^(i-1)*D*disp[i]*B_matrix[i,]*d_matrix[i,]
+    }
+    for(i in 1:nSpecies){
+      for(j in 1:nCommunity){
+        dB[(j-1)*nSpecies+i]=dB[(j-1)*nSpecies+i]-(1+1/(nCommunity-1))*d_matrix[i,j]+sum(d_matrix[i,])/(nCommunity-1)
+      }
+    }
+    return(list(dB))
+  })
+}
+
+# Parallelised function solving the ODE
+ODE_solve<-function(time, params_data, nSpecies, nCommunity, i){
+  params<-c(g=params_data$g[i],
+            r=params_data$r[i],
+            D=params_data$D[i],
+            m=params_data$m[i],
+            a=params_data$a[i],
+            e=params_data$e[i],
+            nSpecies=nSpecies,
+            nCommunity=nCommunity)
+  B0<-equilibrium(params,nSpecies,nCommunity)
+  S_self=set_S(B0,params_data$S0_self[i],nSpecies,nCommunity,"self")
+  S_prey=set_S(B0,params_data$S0_prey[i],nSpecies,nCommunity,"prey")
+  S_pred=set_S(B0,params_data$S0_prey[i],nSpecies,nCommunity,"pred")
+  C_0=set_C(B0,NA,nSpecies,nCommunity,"0",params_data)
+  C_self=set_C(B0,S_self,nSpecies,nCommunity,"self",params_data)
+  C_prey=set_C(B0,S_prey,nSpecies,nCommunity,"prey",params_data)
+  C_pred=set_C(B0,S_pred,nSpecies,nCommunity,"pred",params_data)
+  params<-c(as.list(params),
+            C0=params_data$C0,
+            list(S_self=S_self),list(S_prey=S_prey),list(S_pred=S_pred),
+            list(C_self=C_self),list(C_prey=C_prey),list(C_pred=C_pred),
+            list(disp=params_data$disp[[i]]))
+  B<-B0
+  for(j in 1:length(params_data$pert[[i]])){
+    sp<-params_data$pert[[i]][[j]]
+    B[(sp[2]-1)*nSpecies+sp[1]]=1.1*B[(sp[2]-1)*nSpecies+sp[1]] # perturbation of a species
+  }
+  #B0[params_data$pert[[i]][1]]=5*B0[params_data$pert[[i]][1]]
+  TS<-as.data.frame(ode(B, time, ODE_function, params, method="rk4"))
+  TS<-rbind(c(0,equilibrium(params,nSpecies,nCommunity)),TS) # add the biomasses at equilibrium to the time series
+  for(i in 1:(nSpecies*nCommunity)){
+    TS[,i+1]<-TS[,i+1]/B0[i] # relative change compared to the equilibrium value
+  }
+  return(TS)
+}
+
+# Make a table to plot a correlation matrix
+table_for_matrix<-function(table,nparams){
+  table<-melt(table,
+              id.vars = names(table)[1:nparams],
+              variable.name = "species",
+              value.name = "value")
+  table<-table %>% separate(species,c(NA,"species_1","species_2"),sep="_")
+  table$species_1<-as.factor(table$species_1)
+  table$species_2<-as.factor(table$species_2)
+  table<-table %>% separate(species_1,c("species_1","community_1"),sep=1)
+  table<-table %>% separate(species_2,c("species_2","community_2"),sep=1)
+  return(table)
+}
+
+# Make a table to plot the biomass
+table_for_biomass<-function(table,nparams){
+  table<-melt(table,
+              id.vars = names(table)[1:nparams],
+              variable.name = "species",
+              value.name = "biomass")
+  table<-table %>% separate(species,int=c(NA,"species"),sep="_")
+  table$species<-as.factor(table$species)
+  table<-table %>% separate(species,c("species","community"),sep=1)
+  return(table)
+}
+
+# Retun the weight of each dispersal dependency
+get_weight<-function(B,e,a,m,C0_self,C0_prey,C0_pred,nSpecies){
+  W<-matrix(0,nrow=3,ncol=nSpecies)
+  W[1,]<-C0_self*B
+  if(nSpecies>1){
+    W[2,2:nSpecies]<-C0_prey*e*a*B[1:(nSpecies-1)]
+  }
+  if(nSpecies>1){
+    W[3,1:(nSpecies-1)]<-C0_pred*m*a*B[2:nSpecies]
+  }
+  for(i in 1:nSpecies){
+    W[,i]<-W[,i]/sum(W[,i])
+  }
+  W<-as.data.frame(W)
+  names(W)<-c(1:nSpecies)
+  W$dependency<-c("self","prey","pred")
+  W<-melt(W, id.vars = c("dependency"),
+          variable.name = "species",
+          value.name = "weight")
+  return(W)
+}
+
+# dispersal importance for two patches
+get_dispersal_importance<-function(params_data,nSpecies,i){
+  params<-c(g=params_data$g[i],
+            r=params_data$r[i],
+            D=params_data$D[i],
+            m=params_data$m[i],
+            a=params_data$a[i],
+            e=params_data$e[i],
+            S0_self=params_data$S0_self[i],
+            S0_prey=params_data$S0_prey[i],
+            S0_pred=params_data$S0_pred[i],
+            C0=params_data$C0[i],
+            C0_self=params_data$C0_self[i],
+            C0_prey=params_data$C0_prey[i],
+            C0_pred=params_data$C0_pred[i],
+            correction=params_data$correction[i],
+            weight=params_data$weight[i],
+            d=params_data$d[i])
+  B<-equilibrium(params,nSpecies,1)
+  # effects of trophic interactions
+  trophic<-with(as.list(params),{
+    trophic<-B
+    trophic[1]=trophic[1]+g/D
+    if(nSpecies>1){
+      trophic[2:nSpecies]=trophic[2:nSpecies]+r/D+e*a*B[1:(nSpecies-1)]
+      trophic[1:(nSpecies-1)]=trophic[1:(nSpecies-1)]+m*a*B[2:nSpecies]
+    }
+    trophic<-trophic*B
+  })
+  # effect of dispersal
+  disp<-with(as.list(params),{
+    # effects of basal dispersal
+    disp<-set_C(B,NA,nSpecies,1,"0",params)
+    # effects of self sensity dependency
+    S=set_S(B,S0_self,nSpecies,1,"self")
+    C=set_C(B,S,nSpecies,1,"self",params)
+    disp<-disp+C*B/(B+S)
+    if(nSpecies>1){
+    # effects of prey
+    S=set_S(B,S0_prey,nSpecies,1,"prey")
+    C=set_C(B,S,nSpecies,1,"prey",params)
+    C[is.na(S)]=0
+    S[is.na(S)]=1
+    Bbis<-B
+    Bbis[2:nSpecies]<-B[1:(nSpecies-1)]
+    disp<-disp+C*S/(Bbis+S)
+    # effects of predators
+    S=set_S(B,S0_pred,nSpecies,1,"pred")
+    C=set_C(B,S,nSpecies,1,"pred",params)
+    C[is.na(S)]=0
+    S[is.na(S)]=1
+    Bbis<-B
+    Bbis[1:(nSpecies-1)]<-B[2:nSpecies]
+    disp<-disp+C*Bbis/(Bbis+S)
+    }
+    disp<-2*d*B*disp
+  })
+  return(disp/(trophic+disp))
+}
+
+### PARAMETERS ####
+d_min=-5
+d_max=5
+d_step=0.1
+d=10^(seq(d_min,d_max,d_step))
+
+S0_min=-2
+S0_max=4
+S0_step=0.1
+S0=10^(seq(S0_min,S0_max,S0_step))
+
+g=1
+r=0
+D=1
+e=0.65
+m=c(0.0065,0.065,0.65,6.5,65)
+a=c(1/6.5,1/0.65,1/0.065)
+sigma=1e-3
+z=0.5
+C0=0
+C0_self=1
+C0_prey=1
+C0_pred=1
+correction=1
+weight=0
+pert=list(c(1,1)) # c(species, patch)
+disp=list(c(0,1))# c(species1, species2,..., nSpecies)
+
+params_data_original<-expand.grid(simu_ID=0,
+                                  g=g,
+                                  r=r,
+                                  D=D,
+                                  e=e,
+                                  m=m,
+                                  a=a,
+                                  sigma=sigma,
+                                  z=z,
+                                  weight=weight)
+params_data_original$ma=params_data_original$m*params_data_original$a
+params_data_original<-params_data_original[params_data_original$ma>0.05 & params_data_original$ma<=15,]
+params_data_original$ea=params_data_original$e*params_data_original$a
+params_data_original$simu_ID<-c(1:dim(params_data_original)[1])
+params_data_original$ea<-as.factor(params_data_original$ea)
+params_data_original$ma<-as.factor(params_data_original$ma)
+levels(params_data_original$ma)<-c(ma01,ma1,ma10)
+params_data_original$ma = factor(params_data_original$ma,levels(params_data_original$ma)[c(3,2,1)])
+levels(params_data_original$ea)<-c(ea01,ea1,ea10)
+
+########################## ----
+# DISPERSAL OF PREDATORS DEPENDING ON PREY #### ----
+### SIMULATIONS - S0 - CORRELATION ####
+# parameters
+nSpecies=2
+nCommunity=2
+params_data<-expand.grid(pert=list(list(c(1,1))), # perturbation of prey in patch 1
+                         disp=list(c(0,1)), # dispersal of predators
+                         d=1e3,
+                         S0_self=1,
+                         S0_prey=S0,
+                         S0_pred=1,
+                         C0=0,
+                         C0_self=0,
+                         C0_prey=1,
+                         C0_pred=0,
+                         correction=correction,
+                         model="disp_pred")
+params_data<-merge(params_data_original,params_data)
+params_data<-params_data[params_data$ea==paste(ea10) & params_data$ma==paste(ma10),]
+for(i in 1:dim(params_data)[1]){
+  params_data$disp[[i]]=params_data$disp[[i]]*params_data$d[i]
+}
+VE<-diag(rep(sigma^2,nSpecies*nCommunity)) # independent perturbations
+params_data$VE<-list(VE)
+# simulations
+no_cores <- detectCores() - 1  
+cl <- makeCluster(no_cores)  
+registerDoParallel(cl)  
+results<-foreach(i=1:dim(params_data)[1]) %dopar% analytic(params_data,jacobian_disp_hauzy,nSpecies,nCommunity,i)
+stopCluster(cl)
+list_data<-create_data(params_data,nSpecies,nCommunity)
+data_B<-list_data[[1]][,-which(names(list_data[[1]])%in%c("pert","disp"))]
+data_V<-list_data[[2]][,-which(names(list_data[[2]])%in%c("pert","disp"))]
+data_C<-list_data[[3]][,-which(names(list_data[[3]])%in%c("pert","disp"))]
+for (i in 1:dim(params_data)[1]){
+  data_B[i,which(names(data_B)%in%list_data[[4]])]<-unlist(results[[i]][1])
+  data_V[i,which(names(data_V)%in%list_data[[5]])]<-unlist(results[[i]][2])
+  data_C[i,which(names(data_C)%in%list_data[[6]])]<-unlist(results[[i]][3])
+}
+
+databis<-melt(data_C[,which(names(data_C)%in%c("ea","ma","d","S0_prey","C_11_12",'C_21_22'))],
+              id.vars = c("ea","ma","d","S0_prey"),
+              variable.name = "Species",
+              value.name = "Correlation")
+
+p1<-ggplot(data=databis[databis$d==1e3,])+
+  geom_line(aes(S0_prey,Correlation,colour=Species),size=1.5)+
+  corr_colour_TL_2+
+  theme
+legend<-get_legend(p1)
+
+p1<-ggplot(data=databis[databis$d==1e3,])+
+      geom_line(aes(S0_prey,Correlation,colour=Species),size=1.5)+
+      annotate("text", x=1e3, y=0.5, label="equivalent to\npassive dispersal", size=7, family="times")+
+      annotate("text", x=4*1e-1, y=-0.6, label="effective\ndensity-dependent\ndispersal", size=7, family="times")+
+      corr_colour_TL_2+
+      theme+theme(legend.position = "none")+
+      x_axis_log10_short+
+      ylim(-1,1)+
+      xlab(label_S0)+
+      ylab(label_correlation)
+
+p_img<-image_read_pdf(paste(path_figure,"schema_little_density_pert_TL1_disp_TL2.pdf",sep=""))
+graph<-ggdraw(xlim = c(0, 1.2), ylim = c(0, 1)) +
+  draw_plot(p1, 0, 0, 0.9, 1)+
+  draw_image(p_img, 0.8, 0.6, 0.5, 0.3)+
+  draw_plot(legend, 1.05, 0.1, 0.05, 0.5)
+ggsave(paste(path_figure,"figure_density_dependent.pdf",sep=""),graph , width = 7, height = 5, device = cairo_pdf)
+
+### CV - DEMOGRAPHIC PERTURBATIONS ####
+# parameters
+nSpecies=2
+nCommunity=1
+params_data<-expand.grid(pert=list(list(c(1,1))), # perturbation of species 1
+                         disp=list(c(0,0,0,0)), # no dispersal
+                         d=0,
+                         S0_self=1,
+                         S0_prey=1,
+                         S0_pred=1,
+                         C0=0,
+                         C0_self=0,
+                         C0_prey=0,
+                         C0_pred=0,
+                         correction=correction,
+                         model="pert_1")
+params_data<-merge(params_data_original,params_data)
+params_data<-params_data[params_data$ea==paste(ea10) & params_data$ma==paste(ma10),]
+for(i in 1:dim(params_data)[1]){
+  params_data$disp[[i]]=params_data$disp[[i]]*params_data$d[i]
+}
+VE<-diag(rep(sigma^2,nSpecies*nCommunity)) # independent perturbations
+params_data$VE<-list(VE)
+# simulations
+no_cores <- detectCores() - 1  
+cl <- makeCluster(no_cores)  
+registerDoParallel(cl)  
+results<-foreach(i=1:dim(params_data)[1]) %dopar% analytic(params_data,jacobian_disp_hauzy,nSpecies,nCommunity,i)
+stopCluster(cl)
+list_data<-create_data(params_data,nSpecies,nCommunity)
+data_B<-list_data[[1]][,-which(names(list_data[[1]])%in%c("pert","disp"))]
+data_V<-list_data[[2]][,-which(names(list_data[[2]])%in%c("pert","disp"))]
+data_C<-list_data[[3]][,-which(names(list_data[[3]])%in%c("pert","disp"))]
+for (i in 1:dim(params_data)[1]){
+  data_B[i,which(names(data_B)%in%list_data[[4]])]<-unlist(results[[i]][1])
+  data_V[i,which(names(data_V)%in%list_data[[5]])]<-unlist(results[[i]][2])
+  data_C[i,which(names(data_C)%in%list_data[[6]])]<-unlist(results[[i]][3])
+}
+
+databis<-data_V[,-which(names(data_V)%in%names(params_data)[-which(names(params_data)%in%c("ea","ma","model"))])]
+databis<-table_for_matrix(databis,3)
+databis<-databis[databis$species_1==databis$species_2,]
+databis$species_2<-NULL
+names(databis)[names(databis)=="species_1"]="species"
+databis_2<-data_B[,-which(names(data_B)%in%names(params_data)[-which(names(params_data)%in%c("ea","ma","model"))])]
+databis_2<-table_for_biomass(databis_2,3)
+databis<-merge(databis,databis_2,by=c("ea","ma","model","species"))
+rm(databis_2)
+databis$CV<-sqrt(databis$value)/databis$biomass
+databis$x<-as.numeric(databis$species)
+
+p2<-ggplot(data=databis)+
+      geom_rect(aes(xmin=x-0.5,xmax=x+0.5,ymin=1e-3,ymax=CV,fill=species))+
+      fill_colour_TL_2+
+      scale_x_continuous(breaks=seq(1,2))+
+      scale_y_log10(breaks=c(1e-3,1e-2), labels = scales::trans_format("log10", scales::math_format(10^.x)))+
+      coord_flip()+
+      theme+theme(legend.position = "none")+
+      xlab('Trophic level')+
+      ylab("Coefficient of variation (CV)")
+
+### TIME SERIES PULSE ####
+#parameters
+nSpecies=2
+nCommunity=2
+params_data<-expand.grid(pert=list(list(c(1,1))), # perturbation of prey in patch 1
+                         disp=list(c(0,1)), # dispersal of predators
+                         d=1e2,
+                         S0_self=1,
+                         S0_prey=1e-3,
+                         S0_pred=1,
+                         C0=0,
+                         C0_self=0,
+                         C0_prey=1,
+                         C0_pred=0,
+                         correction=correction,
+                         model="disp_pred")
+params_data<-merge(params_data_original,params_data)
+for(i in 1:dim(params_data)[1]){
+  params_data$disp[[i]]=params_data$disp[[i]]*params_data$d[i]
+}
+params_data<-params_data[params_data$ma==as.character(ma10) & params_data$ea==as.character(ea10),]
+time<-seq(0,8,by=1e-3)
+# simulations
+data_TS<-ODE_solve(time, params_data, nSpecies, nCommunity, 1)
+data_TS<-merge(data_TS,params_data)
+
+databis<-melt(data_TS[,-which(names(data_TS)%in%names(params_data[-which(names(params_data)%in%c("ma","ea","time"))]))],
+              id.vars = c("ma","ea","time"),
+              variable.name = "species",
+              value.name = "biomass")
+levels(databis$species)<-c("1_1","2_1","1_2","2_2")
+databis<-databis %>% separate(species,c("species","community"),sep="_")
+
+p3<-ggplot(data=databis)+
+  geom_line(aes(time,biomass,colour=species,linetype=community),size=1.5)+
+  corr_colour_TL_2+
+  patch_line+
+  theme+theme(legend.direction = "vertical", legend.box = "horizontal")
+legend<-get_legend(p3)
+
+p3<-ggplot(data=databis)+
+      geom_line(aes(time,biomass,colour=species,linetype=community),size=1.5)+
+      corr_colour_TL_2+
+      patch_line+
+      theme+theme(legend.position = "none")+
+      xlab("Time")+
+      ylab("Scaled biomass")
+
+### FINAL GRAPH ####
+graph<-ggdraw(xlim = c(0, 1.6), ylim = c(0, 0.7)) +
+  draw_plot(p2, 0, 0.25, 0.6, 0.4)+
+  draw_plot(p3, 0.6, 0, 1, 0.7)+
+  draw_plot(legend, 0.3, -0.12, 0.05, 0.5)+
+  draw_plot_label(c("A","B"), c(0,0.55), c(0.7,0.7), size = 30)
+ggsave(paste(path_figure,"supp_density_dependent.pdf",sep=""),graph, width = 10, height = 6, device = cairo_pdf)
