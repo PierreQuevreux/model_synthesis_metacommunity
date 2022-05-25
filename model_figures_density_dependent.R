@@ -10,6 +10,7 @@ library(magick) # magick_2.7.1
 library(tidyr) # tidyr_1.1.3
 library(viridis) # viridis_0.5.1
 
+#sessionInfo()
 ### loaded via a namespace (and not attached): ####
 # [1] Rcpp_1.0.6       pillar_1.6.0     compiler_3.6.3   plyr_1.8.6       tools_3.6.3      lifecycle_1.0.0  tibble_3.1.0     gtable_0.2.0     pkgconfig_2.0.3 
 # [10] rlang_0.4.10     DBI_1.1.1        gridExtra_2.3    withr_2.4.1      dplyr_1.0.5      stringr_1.4.0    generics_0.1.0   vctrs_0.3.6      grid_3.6.3      

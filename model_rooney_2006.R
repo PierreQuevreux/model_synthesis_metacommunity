@@ -1,10 +1,18 @@
-library(ggplot2)
-library(cowplot)
-library(reshape2)
-library(scales)
-library(doParallel)
-library(deSolve)
-library(numDeriv)
+# R version 3.6.3 (2020-02-29)
+library(ggplot2) # ggplot2_3.3.5
+library(cowplot) # cowplot_1.1.1
+library(reshape2) # reshape2_1.4.4
+library(scales) # scales_1.1.1
+library(doParallel) # doParallel_1.0.16 iterators_1.0.1 foreach_1.5.1
+library(deSolve) # deSolve_1.30
+library(numDeriv) # numDeriv_2016.8-1.1
+
+#sessionInfo()
+# loaded via a namespace (and not attached):
+# [1] Rcpp_1.0.7       pillar_1.6.4     compiler_3.6.3   plyr_1.8.6       tools_3.6.3      lifecycle_1.0.1  tibble_3.1.6     gtable_0.3.0    
+# [9] pkgconfig_2.0.3  rlang_0.4.12     DBI_1.1.2        withr_2.4.3      dplyr_1.0.7      stringr_1.4.0    generics_0.1.1   vctrs_0.3.8     
+# [17] grid_3.6.3       tidyselect_1.1.1 glue_1.6.0       R6_2.5.1         fansi_0.5.0      purrr_0.3.4      magrittr_2.0.1   codetools_0.2-16
+# [25] ellipsis_0.3.2   assertthat_0.2.1 colorspace_2.0-2 utf8_1.2.2       stringi_1.7.6    munsell_0.5.0    crayon_1.4.2          
 
 ### PLOT OPTIONS ####
 
