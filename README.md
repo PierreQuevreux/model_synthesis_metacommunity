@@ -1,5 +1,7 @@
 # model_synthesis_metacommunity
 
+R files include the code of simulations and figures.
+
 model_figures_density_dependent : R code of the metacommunity model with density-dependent dispersal
 
 model_spatial_heterogeneity : R code of the metacommunity model with spatial heterogeneity
