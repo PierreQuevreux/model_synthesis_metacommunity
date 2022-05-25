@@ -1,6 +1,6 @@
 # model_synthesis_metacommunity
 
-R files include the code of simulations and figures.
+R files include the code of simulations and figures. R and package versions are detailed in each .R file.
 
 model_figures_density_dependent : R code of the metacommunity model with density-dependent dispersal
 
